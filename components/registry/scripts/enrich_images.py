@@ -26,70 +26,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
 
 import requests
-from _utils.image_url_policy import DISALLOWED_IMAGE_HOSTS, DISALLOWED_IMAGE_QUERY_KEYS
 from _utils.io import load_json
 from _utils.paths import source_components_dir
+from _utils.url_policy import (
+    image_has_signed_query,
+    image_host_disallowed,
+    is_https_url,
+)
 from requests.adapters import HTTPAdapter
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_WORKERS = min(32, max(4, (os.cpu_count() or 4) * 5))
-
-
-def _is_https_url(url: str) -> bool:
-    """Return True if a URL is a well-formed HTTPS URL.
-
-    Parameters
-    ----------
-    url
-        URL to check.
-
-    Returns
-    -------
-    bool
-        True if the URL uses the ``https`` scheme and has a non-empty network
-        location (host).
-    """
-    p = urlparse(url)
-    return p.scheme == "https" and bool(p.netloc)
-
-
-def _is_disallowed_host(url: str) -> bool:
-    """Return True if the URL host is disallowed for preview images.
-
-    Parameters
-    ----------
-    url
-        URL to check.
-
-    Returns
-    -------
-    bool
-        True if the URL host is in the disallowed host list.
-    """
-    host = (urlparse(url).netloc or "").lower()
-    return host in DISALLOWED_IMAGE_HOSTS
-
-
-def _has_disallowed_query_params(url: str) -> bool:
-    """Return True if the URL includes signed/expiring query parameters.
-
-    Parameters
-    ----------
-    url
-        URL to check.
-
-    Returns
-    -------
-    bool
-        True if any query parameter key matches a disallowed key (case-insensitive).
-    """
-    for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True):
-        if k.strip().lower() in DISALLOWED_IMAGE_QUERY_KEYS:
-            return True
-    return False
 
 
 def _is_imageish_content_type(ct: str | None) -> bool:
@@ -356,15 +305,15 @@ def check_images(
             # Optional: null/empty is allowed.
             continue
 
-        if not _is_https_url(img):
+        if not is_https_url(img):
             local_failures[json_file.name] = f"not https:// ({img})"
             continue
 
-        if _is_disallowed_host(img):
+        if image_host_disallowed(img):
             local_failures[json_file.name] = f"disallowed_host=camo ({img})"
             continue
 
-        if _has_disallowed_query_params(img):
+        if image_has_signed_query(img):
             local_failures[json_file.name] = f"signed/expiring_url ({img})"
             continue
 
