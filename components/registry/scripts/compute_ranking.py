@@ -13,6 +13,25 @@ The final score is:
 
 If recency data is missing, the score falls back to the stars-only term.
 
+Determinism / stable diffs
+--------------------------
+The ranking block is treated as a pure function of the catalog's *inputs*, not of
+wall-clock time, so re-running the pipeline without any underlying change produces a
+byte-identical artifact (no noisy PR diffs):
+
+- Recency is measured relative to each metric's ``fetchedAt`` (when the metric was
+  observed) rather than ``now``. ``fetchedAt`` only advances when enrichment actually
+  refetches, so a pure rerun yields identical recency.
+- All emitted numbers are rounded to a fixed precision to avoid cross-platform
+  floating-point jitter.
+- ``computedAt`` is a change marker: it is carried forward from the existing ranking
+  block when the recomputed score/signals are unchanged, and only advances when they
+  actually change.
+
+This script reads the ranking block that ``build_catalog.py`` carries forward from the
+previous artifact, so build and ranking cooperate: build never recomputes ranking, and
+ranking only rewrites the blocks (and their timestamps) that genuinely changed.
+
 Run from the repo root (recommended):
 
     python components/registry/scripts/compute_ranking.py
@@ -29,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from _utils.io import dump_json_atomic, load_json
-from _utils.time import parse_iso8601, utc_now_iso
+from _utils.time import parse_iso8601, stable_timestamp
 
 
 @dataclass(frozen=True)
@@ -83,6 +102,21 @@ def _days_since(dt: datetime, now: datetime) -> float:
     return delta_s / 86400.0
 
 
+# Precision for emitted ranking numbers. Rounding keeps diffs stable across platforms
+# (log10/exp can differ in the last ULP) without affecting ranking ordering.
+_ROUND_NDIGITS = 6
+
+
+def _round_signal(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return round(float(value), _ROUND_NDIGITS)
+    return value
+
+
 def _get_nested(comp: dict[str, Any], *path: str) -> Any:
     cur: Any = comp
     for p in path:
@@ -123,8 +157,15 @@ def _recency_days(
     gh_dt = parse_iso8601(gh_last_push if isinstance(gh_last_push, str) else None)
     pypi_dt = parse_iso8601(pypi_latest_release if isinstance(pypi_latest_release, str) else None)
 
-    gh_days = _days_since(gh_dt, now) if gh_dt else None
-    pypi_days = _days_since(pypi_dt, now) if pypi_dt else None
+    # Measure recency relative to when each metric was *observed* (its fetchedAt)
+    # rather than wall-clock `now`. fetchedAt only advances when enrichment actually
+    # refetches, so a pure rerun (no refetch) yields identical recency and therefore
+    # no diff. `now` is only a fallback for hand-authored artifacts lacking fetchedAt.
+    gh_ref = parse_iso8601(_get_nested(comp, "metrics", "github", "fetchedAt")) or now
+    pypi_ref = parse_iso8601(_get_nested(comp, "metrics", "pypi", "fetchedAt")) or now
+
+    gh_days = _days_since(gh_dt, gh_ref) if gh_dt else None
+    pypi_days = _days_since(pypi_dt, pypi_ref) if pypi_dt else None
 
     days_since_update: float | None
     if gh_days is not None and pypi_days is not None:
@@ -135,7 +176,9 @@ def _recency_days(
     return days_since_update, gh_days, pypi_days
 
 
-def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime) -> dict[str, Any]:
+def _compute_ranking(
+    comp: dict[str, Any], *, cfg: RankingConfig, now: datetime, now_iso: str
+) -> dict[str, Any]:
     stars = _stars_for_component(comp)
     stars_score = math.log10(stars + 1)
 
@@ -162,19 +205,21 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
     if downloads_score is not None:
         score += cfg.w_downloads * downloads_score
 
-    # Keep ranking explainable and stable.
+    # Keep ranking explainable and stable. `computedAt` is a placeholder here; the
+    # caller replaces it with a carried-forward value when the score/signals are
+    # unchanged, so unchanged rankings produce no diff.
     return {
-        "score": score,
+        "score": _round_signal(score),
         "signals": {
-            "starsScore": stars_score,
-            "recencyScore": recency_score,
-            "contributorsScore": contributors_score,
-            "daysSinceUpdate": days_since_update,
-            "daysSinceGithubPush": gh_days,
-            "daysSincePypiRelease": pypi_days,
-            "downloadsScore": downloads_score,
+            "starsScore": _round_signal(stars_score),
+            "recencyScore": _round_signal(recency_score),
+            "contributorsScore": _round_signal(contributors_score),
+            "daysSinceUpdate": _round_signal(days_since_update),
+            "daysSinceGithubPush": _round_signal(gh_days),
+            "daysSincePypiRelease": _round_signal(pypi_days),
+            "downloadsScore": _round_signal(downloads_score),
         },
-        "computedAt": utc_now_iso(),
+        "computedAt": now_iso,
     }
 
 
@@ -203,6 +248,7 @@ def compute_rankings(
 
     cfg = _load_ranking_config(config_path)
     now = datetime.now(UTC)
+    now_iso = now.isoformat().replace("+00:00", "Z")
 
     processed = 0
     for comp in comps:
@@ -211,7 +257,14 @@ def compute_rankings(
         if limit is not None and processed >= limit:
             break
         processed += 1
-        comp["ranking"] = _compute_ranking(comp, cfg=cfg, now=now)
+        previous_ranking = comp.get("ranking")
+        new_ranking = _compute_ranking(comp, cfg=cfg, now=now, now_iso=now_iso)
+        # `computedAt` is a change marker: reuse the previous value when the recomputed
+        # score/signals are identical so unchanged rankings produce no diff.
+        new_ranking["computedAt"] = stable_timestamp(
+            new_ranking, previous_ranking, timestamp_key="computedAt", now=now_iso
+        )
+        comp["ranking"] = new_ranking
 
     dump_json_atomic(compiled_out, obj)
     print(f"Wrote rankings for {processed} component(s) to {compiled_out}.")

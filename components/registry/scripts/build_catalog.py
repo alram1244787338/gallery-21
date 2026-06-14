@@ -9,6 +9,12 @@ It also supports carrying forward "last-known-good" computed fields (e.g. stars)
 from a previous compiled artifact to avoid regressing metrics when enrichment is
 not yet implemented.
 
+For stable, low-noise diffs the output is treated as a pure function of its inputs:
+``generatedAt`` is carried forward from the previous artifact unless the catalog's
+composition (categories/components, including carried-forward metrics and ranking)
+actually changed. A pure rebuild therefore produces a byte-identical file. Ranking
+blocks are carried forward verbatim here; ``compute_ranking.py`` owns recomputing them.
+
 Run from the repo root (recommended):
 
     python components/registry/scripts/build_catalog.py
@@ -37,7 +43,7 @@ from typing import Any
 
 from _utils.github import normalize_github_repo_url, repo_key
 from _utils.io import dump_json_atomic, load_json
-from _utils.time import utc_now_iso
+from _utils.time import stable_timestamp, utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -111,14 +117,19 @@ def _component_key_from_github_url(url: str) -> str:
     return repo_key(url)
 
 
-def _load_previous_index(previous_path: Path | None) -> dict[str, dict[str, Any]]:
-    """Index previous compiled components by canonical github owner/repo."""
+def _load_previous_artifact(previous_path: Path | None) -> dict[str, Any] | None:
+    """Load the previous compiled artifact (used for carry-forward + stable timestamps)."""
     if previous_path is None or not previous_path.is_file():
-        return {}
+        return None
     obj = load_json(previous_path)
-    if not isinstance(obj, dict):
+    return obj if isinstance(obj, dict) else None
+
+
+def _index_previous(previous_obj: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Index previous compiled components by canonical github owner/repo."""
+    if not isinstance(previous_obj, dict):
         return {}
-    comps = obj.get("components", [])
+    comps = previous_obj.get("components", [])
     if not isinstance(comps, list):
         return {}
 
@@ -197,7 +208,8 @@ def build_catalog(
 ) -> tuple[dict[str, Any], list[ComponentBuildError]]:
     schema = _load_schema(registry_root)
     categories = _taxonomy_categories(registry_root)
-    prev_index = _load_previous_index(previous_path)
+    previous_obj = _load_previous_artifact(previous_path)
+    prev_index = _index_previous(previous_obj)
 
     errors: list[ComponentBuildError] = []
     compiled_components: list[dict[str, Any]] = []
@@ -356,12 +368,19 @@ def build_catalog(
     # Deterministic ordering for stable diffs.
     compiled_components.sort(key=lambda c: (c.get("gitHubUrl") or "", c.get("title") or ""))
 
+    now_iso = utc_now_iso()
     compiled = {
-        "generatedAt": utc_now_iso(),
+        "generatedAt": now_iso,
         "schemaVersion": 1,
         "categories": categories,
         "components": compiled_components,
     }
+    # `generatedAt` marks when the catalog's *composition* last changed. Reuse the
+    # previous value when everything else is unchanged so a pure rebuild (same sources,
+    # same carried-forward metrics/ranking) produces a byte-identical artifact.
+    compiled["generatedAt"] = stable_timestamp(
+        compiled, previous_obj, timestamp_key="generatedAt", now=now_iso
+    )
     return compiled, errors
 
 
