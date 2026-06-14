@@ -40,6 +40,23 @@ from _utils.io import dump_json_atomic, load_json
 from _utils.time import utc_now_iso
 
 
+def _components_for_diff(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return components stripped of carry-forward volatile fields for comparison.
+
+    This is used to decide whether the new build materially differs from the
+    previous compiled artifact.  We only strip fields that are *expected* to
+    change on every rerun even when source data is unchanged — namely the
+    per-component ``ranking`` block (re-written by ``compute_ranking.py``).
+    Metrics are carry-forward verbatim so they are stable when source data
+    is unchanged.
+    """
+    result: list[dict[str, Any]] = []
+    for c in components:
+        c2 = {k: v for k, v in c.items() if k != "ranking"}
+        result.append(c2)
+    return result
+
+
 @dataclass(frozen=True)
 class ComponentBuildError:
     file: Path
@@ -111,16 +128,21 @@ def _component_key_from_github_url(url: str) -> str:
     return repo_key(url)
 
 
-def _load_previous_index(previous_path: Path | None) -> dict[str, dict[str, Any]]:
-    """Index previous compiled components by canonical github owner/repo."""
+def _load_previous(previous_path: Path | None) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Load previous compiled artifact, returning (full_object, component_index).
+
+    The full object is used for ``generatedAt`` preservation; the index maps
+    canonical github ``owner/repo`` keys to their compiled component dicts for
+    carry-forward of metrics and rankings.
+    """
     if previous_path is None or not previous_path.is_file():
-        return {}
+        return {}, {}
     obj = load_json(previous_path)
     if not isinstance(obj, dict):
-        return {}
+        return {}, {}
     comps = obj.get("components", [])
     if not isinstance(comps, list):
-        return {}
+        return obj, {}
 
     out: dict[str, dict[str, Any]] = {}
     for c in comps:
@@ -134,7 +156,7 @@ def _load_previous_index(previous_path: Path | None) -> dict[str, dict[str, Any]
         except Exception:
             continue
         out[key] = c
-    return out
+    return obj, out
 
 
 def _prev_int(prev: dict[str, Any], *path: str) -> int | None:
@@ -197,7 +219,7 @@ def build_catalog(
 ) -> tuple[dict[str, Any], list[ComponentBuildError]]:
     schema = _load_schema(registry_root)
     categories = _taxonomy_categories(registry_root)
-    prev_index = _load_previous_index(previous_path)
+    prev_obj, prev_index = _load_previous(previous_path)
 
     errors: list[ComponentBuildError] = []
     compiled_components: list[dict[str, Any]] = []
@@ -356,8 +378,20 @@ def build_catalog(
     # Deterministic ordering for stable diffs.
     compiled_components.sort(key=lambda c: (c.get("gitHubUrl") or "", c.get("title") or ""))
 
+    # Preserve ``generatedAt`` from the previous artifact when the compiled
+    # component content is materially unchanged.  This keeps pure reruns from
+    # dirtying the diff with a new timestamp.
+    generated_at = utc_now_iso()
+    prev_components = prev_obj.get("components") if isinstance(prev_obj, dict) else None
+    if isinstance(prev_components, list):
+        prev_generated_at = prev_obj.get("generatedAt")
+        if isinstance(prev_generated_at, str) and _components_for_diff(
+            compiled_components
+        ) == _components_for_diff(prev_components):
+            generated_at = prev_generated_at
+
     compiled = {
-        "generatedAt": utc_now_iso(),
+        "generatedAt": generated_at,
         "schemaVersion": 1,
         "categories": categories,
         "components": compiled_components,

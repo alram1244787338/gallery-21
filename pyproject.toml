@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pre-commit", "ruff"]
+dev = ["pre-commit", "ruff", "pytest>=8"]
 
 [tool.ruff]
 target-version = "py312"

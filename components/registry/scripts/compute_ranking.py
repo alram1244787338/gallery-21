@@ -150,9 +150,18 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
         downloads_score = math.log10(downloads_last_month + 1)
 
     days_since_update, gh_days, pypi_days = _recency_days(comp, now)
+
+    # Round day-count signals to whole days BEFORE computing derived scores.
+    # This ensures that re-running the script within the same day produces
+    # byte-identical output.  Without rounding, ``daysSince*`` drifts by the
+    # second, which in turn perturbs ``recencyScore`` and ``score``.
+    stable_days_since_update = round(days_since_update) if days_since_update is not None else None
+    stable_gh_days = round(gh_days) if gh_days is not None else None
+    stable_pypi_days = round(pypi_days) if pypi_days is not None else None
+
     recency_score: float | None = None
-    if days_since_update is not None:
-        recency_score = math.exp(-days_since_update / cfg.half_life_days)
+    if stable_days_since_update is not None:
+        recency_score = math.exp(-stable_days_since_update / cfg.half_life_days)
 
     score = cfg.w_stars * stars_score
     if recency_score is not None:
@@ -169,13 +178,40 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
             "starsScore": stars_score,
             "recencyScore": recency_score,
             "contributorsScore": contributors_score,
-            "daysSinceUpdate": days_since_update,
-            "daysSinceGithubPush": gh_days,
-            "daysSincePypiRelease": pypi_days,
+            "daysSinceUpdate": stable_days_since_update,
+            "daysSinceGithubPush": stable_gh_days,
+            "daysSincePypiRelease": stable_pypi_days,
             "downloadsScore": downloads_score,
         },
         "computedAt": utc_now_iso(),
     }
+
+
+def _ranking_changed(new_ranking: dict[str, Any], old_ranking: Any) -> bool:
+    """Return True when *new_ranking* carries materially different values.
+
+    ``computedAt`` is ignored — it is a metadata timestamp, not a signal.
+    """
+    if not isinstance(old_ranking, dict):
+        return True
+    if new_ranking.get("score") != old_ranking.get("score"):
+        return True
+    new_signals = new_ranking.get("signals")
+    old_signals = old_ranking.get("signals")
+    if not isinstance(new_signals, dict) or not isinstance(old_signals, dict):
+        return True
+    for key in (
+        "starsScore",
+        "recencyScore",
+        "contributorsScore",
+        "downloadsScore",
+        "daysSinceUpdate",
+        "daysSinceGithubPush",
+        "daysSincePypiRelease",
+    ):
+        if new_signals.get(key) != old_signals.get(key):
+            return True
+    return False
 
 
 def compute_rankings(
@@ -211,7 +247,13 @@ def compute_rankings(
         if limit is not None and processed >= limit:
             break
         processed += 1
-        comp["ranking"] = _compute_ranking(comp, cfg=cfg, now=now)
+        new_ranking = _compute_ranking(comp, cfg=cfg, now=now)
+        old_ranking = comp.get("ranking")
+        if not _ranking_changed(new_ranking, old_ranking):
+            # Preserve the previous computedAt when the signals are identical
+            # so pure reruns don't dirty the diff.
+            new_ranking["computedAt"] = old_ranking["computedAt"]
+        comp["ranking"] = new_ranking
 
     dump_json_atomic(compiled_out, obj)
     print(f"Wrote rankings for {processed} component(s) to {compiled_out}.")
