@@ -8,6 +8,32 @@
   "properties": {
     "generatedAt": { "type": "string", "format": "date-time" },
     "schemaVersion": { "type": "integer", "const": 1 },
+    "pipeline": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Provenance for the run that produced this artifact. Lets a reader tell whether enrichment actually ran or values were reused offline.",
+      "properties": {
+        "ranAt": { "type": ["string", "null"], "format": "date-time" },
+        "enriched": {
+          "type": ["boolean", "null"],
+          "description": "True if at least one enrichment service fetched data during this run."
+        },
+        "offline": {
+          "type": ["boolean", "null"],
+          "description": "True if this run skipped all enrichment (e.g. --no-enrich); metric values were reused from the prior artifact."
+        },
+        "services": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "Enrichment services that ran this pipeline (empty when offline)."
+        },
+        "rankingBasis": {
+          "type": ["string", "null"],
+          "enum": ["live", "stale", "missing", "mixed", null],
+          "description": "Roll-up freshness of the data ranking was computed from."
+        }
+      }
+    },
     "categories": {
       "type": "array",
       "minItems": 1,
@@ -120,6 +146,15 @@
             "properties": {
               "score": { "type": "number" },
               "computedAt": { "type": "string", "format": "date-time" },
+              "basis": {
+                "type": ["string", "null"],
+                "enum": ["live", "stale", "missing", null],
+                "description": "Freshness of the metrics this score was computed from."
+              },
+              "offline": {
+                "type": ["boolean", "null"],
+                "description": "True if this ranking was (re)computed during a run with no enrichment."
+              },
               "signals": {
                 "type": "object",
                 "additionalProperties": false,

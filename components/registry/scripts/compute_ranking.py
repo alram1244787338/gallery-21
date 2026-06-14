@@ -13,6 +13,16 @@ The final score is:
 
 If recency data is missing, the score falls back to the stars-only term.
 
+Each component's `ranking` also records:
+
+- `basis`  -- freshness of the metrics the score was computed from
+             (`live` / `stale` / `missing`).
+- `offline`-- whether this score was produced by a run that skipped enrichment.
+
+In `--offline` mode, a component with no metrics at all (which can only score 0)
+will not overwrite a previously-good score; the prior ranking is preserved and
+re-stamped `basis="missing"` so offline runs cannot silently pollute the artifact.
+
 Run from the repo root (recommended):
 
     python components/registry/scripts/compute_ranking.py
@@ -23,12 +33,14 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from _utils.io import dump_json_atomic, load_json
+from _utils.provenance import component_basis, is_score_degenerate, summarize_basis
 from _utils.time import parse_iso8601, utc_now_iso
 
 
@@ -135,7 +147,9 @@ def _recency_days(
     return days_since_update, gh_days, pypi_days
 
 
-def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime) -> dict[str, Any]:
+def _compute_ranking(
+    comp: dict[str, Any], *, cfg: RankingConfig, now: datetime, offline: bool
+) -> dict[str, Any]:
     stars = _stars_for_component(comp)
     stars_score = math.log10(stars + 1)
 
@@ -162,7 +176,10 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
     if downloads_score is not None:
         score += cfg.w_downloads * downloads_score
 
-    # Keep ranking explainable and stable.
+    # Keep ranking explainable and stable. `basis` records the freshness of the
+    # metrics this score was computed from, and `offline` flags scores produced
+    # by a run that skipped enrichment, so a reader can tell whether a fresh
+    # `computedAt` reflects fresh data or merely a fresh recomputation.
     return {
         "score": score,
         "signals": {
@@ -174,6 +191,8 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
             "daysSincePypiRelease": pypi_days,
             "downloadsScore": downloads_score,
         },
+        "basis": component_basis(comp),
+        "offline": offline,
         "computedAt": utc_now_iso(),
     }
 
@@ -184,6 +203,9 @@ def compute_rankings(
     compiled_out: Path,
     config_path: Path,
     limit: int | None,
+    offline: bool = False,
+    services: list[str] | None = None,
+    stamp_pipeline: bool = False,
 ) -> int:
     obj = load_json(compiled_in)
     if not isinstance(obj, dict):
@@ -201,20 +223,80 @@ def compute_rankings(
         )
         return 2
 
+    services = list(services or [])
     cfg = _load_ranking_config(config_path)
     now = datetime.now(UTC)
 
     processed = 0
+    preserved = 0
+    bases: list[str] = []
     for comp in comps:
         if not isinstance(comp, dict):
             continue
         if limit is not None and processed >= limit:
             break
         processed += 1
-        comp["ranking"] = _compute_ranking(comp, cfg=cfg, now=now)
+
+        prior = comp.get("ranking")
+        prior = prior if isinstance(prior, dict) else None
+        new_ranking = _compute_ranking(comp, cfg=cfg, now=now, offline=offline)
+
+        # Anti-pollution guard: an offline run must not replace a previously-good
+        # score with a degenerate "no data" score (a component with no metrics can
+        # only score 0, which looks like "ranked last" but is really "unknown").
+        # Preserve the prior score/signals but restamp basis+offline so the
+        # artifact still tells the truth: touched offline, data missing.
+        prior_score = prior.get("score") if prior else None
+        if (
+            offline
+            and is_score_degenerate(comp)
+            and isinstance(prior_score, (int, float))
+            and prior_score > 0
+        ):
+            kept = dict(prior)
+            kept["basis"] = "missing"
+            kept["offline"] = True
+            comp["ranking"] = kept
+            preserved += 1
+        else:
+            comp["ranking"] = new_ranking
+
+        bases.append(str(comp["ranking"].get("basis")))
+
+    overall_basis = summarize_basis(bases)
+    if stamp_pipeline:
+        # compute_ranking is the pipeline's final writer, so it owns the run-level
+        # provenance stamp. Standalone invocations (no offline/services context)
+        # leave this untouched rather than fabricate a misleading record.
+        obj["pipeline"] = {
+            "ranAt": utc_now_iso(),
+            "enriched": bool(services),
+            "offline": bool(offline),
+            "services": services,
+            "rankingBasis": overall_basis,
+        }
 
     dump_json_atomic(compiled_out, obj)
-    print(f"Wrote rankings for {processed} component(s) to {compiled_out}.")
+
+    counts = Counter(bases)
+    mode = "OFFLINE (enrichment skipped)" if offline else "online"
+    print(f"Computed rankings for {processed} component(s) [{mode}].")
+    print(
+        f"  data freshness: live={counts.get('live', 0)} "
+        f"stale={counts.get('stale', 0)} missing={counts.get('missing', 0)}; "
+        f"overall={overall_basis}",
+    )
+    if preserved:
+        print(
+            f"  preserved {preserved} prior ranking(s) instead of overwriting them with a "
+            "no-data (score 0) result.",
+        )
+    if counts.get("stale") or counts.get("missing"):
+        print(
+            "  NOTE: some scores are based on stale or missing metrics; "
+            "re-run enrichment for an authoritative ranking.",
+        )
+    print(f"  wrote {compiled_out}")
     return 0
 
 
@@ -248,7 +330,31 @@ def main(argv: list[str]) -> int:
         default=None,
         help="Only process the first N components (debug).",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Mark rankings as computed during a run that skipped enrichment "
+            "(metric values reused from the prior artifact). Also prevents "
+            "components with no metrics from overwriting a prior good score."
+        ),
+    )
+    parser.add_argument(
+        "--enriched-services",
+        default="",
+        help=(
+            "Comma-separated enrichment services that ran this pipeline, recorded "
+            "in the artifact's `pipeline` provenance block (e.g. 'github,pypi'). "
+            "Empty implies an offline run."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    services = [s.strip() for s in str(args.enriched_services).split(",") if s.strip()]
+    # Only stamp run-level provenance when invoked with pipeline context (offline
+    # flag or an explicit service list); a bare standalone run should not fabricate
+    # a `pipeline` record.
+    stamp_pipeline = bool(args.offline) or bool(services)
 
     script_path = Path(__file__).resolve()
     registry_root = script_path.parents[1]  # components/registry
@@ -275,6 +381,9 @@ def main(argv: list[str]) -> int:
         compiled_out=compiled_out,
         config_path=config_path,
         limit=args.limit,
+        offline=bool(args.offline),
+        services=services,
+        stamp_pipeline=stamp_pipeline,
     )
 
 

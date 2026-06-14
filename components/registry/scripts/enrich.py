@@ -207,6 +207,25 @@ def main(argv: list[str]) -> int:
             flush=True,
         )
 
+    # Spell out the field policy so a maintainer reading logs knows exactly which
+    # values were overwritten, kept, or marked — without diffing the artifact.
+    total_updated = sum(result.stats[e.name].updated for e in enrichers)
+    total_fresh = sum(result.stats[e.name].skipped_fresh for e in enrichers)
+    total_failed = sum(result.stats[e.name].failed for e in enrichers)
+    total_no_key = sum(result.stats[e.name].skipped_no_key for e in enrichers)
+    print(
+        "Field policy: successful fetch -> new values + isStale=false; "
+        "skipped-as-fresh -> existing values kept untouched; "
+        "no GitHub/PyPI key -> bucket left as-is; "
+        "failed fetch -> prior values kept, isStale=true.",
+        flush=True,
+    )
+    print(
+        f"Totals across services: updated={total_updated} kept_fresh={total_fresh} "
+        f"no_key={total_no_key} failed={total_failed}.",
+        flush=True,
+    )
+
     any_failures = False
     for enricher in enrichers:
         fails = result.failures[enricher.name]
@@ -239,6 +258,11 @@ def main(argv: list[str]) -> int:
 
     dump_json_atomic(compiled_out, obj)
     ts = utc_now_iso()
+    if any_failures:
+        print(
+            "NOTE: some fetches failed; affected components kept their prior values "
+            "and were marked isStale=true (persisted because --allow-failures)."
+        )
     print(f"Wrote {compiled_out} at {ts}.")
     return 0
 

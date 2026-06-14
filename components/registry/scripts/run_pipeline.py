@@ -19,6 +19,12 @@ Typical CI usage:
 
     # Build + validate only (no network)
     python components/registry/scripts/run_pipeline.py --no-enrich
+
+Offline runs (no enrichment services, e.g. --no-enrich) are made self-describing:
+metric values are reused from the prior artifact, and the ranking step stamps each
+component's `ranking.basis`/`ranking.offline` plus a top-level `pipeline` provenance
+block so a reader can always tell whether the artifact reflects fresh data or a
+reused-offline state. A component with no metrics never overwrites a prior good score.
 """
 
 from __future__ import annotations
@@ -218,6 +224,10 @@ def main(argv: list[str]) -> int:
     if not args.no_pypistats:
         services.append("pypistats")
 
+    # "offline" == no enrichment service ran this pipeline (e.g. --no-enrich).
+    # In that case metric values are reused as-is from the prior compiled artifact.
+    offline = not services
+
     if services:
         cmd = [
             py,
@@ -244,15 +254,35 @@ def main(argv: list[str]) -> int:
         rc = run_step("Enrich catalog", cmd)
         if rc != 0:
             return rc
+    else:
+        print(
+            "\n==> Enrich catalog [SKIPPED — offline]\n"
+            "No enrichment services selected (e.g. --no-enrich). Metric values "
+            "(stars, downloads, release dates, ...) are reused as-is from the prior "
+            "compiled artifact; ranking will mark them stale/missing as appropriate.",
+            flush=True,
+        )
 
-    # 6) Compute ranking
+    # 6) Compute ranking. Pass run context so the artifact records whether this was
+    # an offline run and which services backed it.
     if not args.no_ranking:
         cmd = [py, str(scripts_dir / "compute_ranking.py")]
         if args.limit is not None:
             cmd += ["--limit", str(args.limit)]
+        if offline:
+            cmd += ["--offline"]
+        else:
+            cmd += ["--enriched-services", ",".join(services)]
         rc = run_step("Compute ranking", cmd)
         if rc != 0:
             return rc
+    elif offline:
+        print(
+            "WARNING: --no-ranking combined with offline mode means this run leaves "
+            "no freshness marker on the artifact. The compiled `ranking`/`pipeline` "
+            "fields will still reflect the *previous* run, not this one.",
+            flush=True,
+        )
 
     # 7) Final validate compiled artifact
     if not args.no_validate:
@@ -263,7 +293,25 @@ def main(argv: list[str]) -> int:
         if rc != 0:
             return rc
 
-    print("\nOK: pipeline completed successfully.")
+    print("\n" + "=" * 60)
+    if offline:
+        print("OK: pipeline completed in OFFLINE mode (enrichment skipped).")
+        print("  - Metric values were reused as-is from the prior compiled artifact.")
+        print("  - This artifact is NOT a fresh metrics refresh.")
+        if not args.no_ranking:
+            print(
+                "  - Inspect compiled/components.json `pipeline.rankingBasis` and each "
+                "`ranking.basis`/`ranking.offline` to see exactly what data backed this run."
+            )
+        else:
+            print("  - Ranking was skipped, so no freshness marker was written this run.")
+    else:
+        print("OK: pipeline completed successfully (enrichment ran).")
+        print(f"  - Enriched services: {', '.join(services)}.")
+        print(
+            "  - Components whose fetches failed keep their prior values and are "
+            "marked isStale=true; see the enrich step output above."
+        )
     return 0
 
 
