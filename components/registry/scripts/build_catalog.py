@@ -137,6 +137,20 @@ def _load_previous_index(previous_path: Path | None) -> dict[str, dict[str, Any]
     return out
 
 
+def _load_previous_generated_at(previous_path: Path | None) -> str | None:
+    """Read the `generatedAt` timestamp from a previous compiled artifact."""
+    if previous_path is None or not previous_path.is_file():
+        return None
+    try:
+        obj = load_json(previous_path)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    val = obj.get("generatedAt")
+    return str(val) if isinstance(val, str) and val else None
+
+
 def _prev_int(prev: dict[str, Any], *path: str) -> int | None:
     cur: Any = prev
     for p in path:
@@ -194,6 +208,8 @@ def build_catalog(
     components_dir: Path,
     previous_path: Path | None,
     skip_invalid: bool,
+    pipeline_mode: str = "full",
+    carry_forward_generated_at: bool = False,
 ) -> tuple[dict[str, Any], list[ComponentBuildError]]:
     schema = _load_schema(registry_root)
     categories = _taxonomy_categories(registry_root)
@@ -356,12 +372,33 @@ def build_catalog(
     # Deterministic ordering for stable diffs.
     compiled_components.sort(key=lambda c: (c.get("gitHubUrl") or "", c.get("title") or ""))
 
-    compiled = {
-        "generatedAt": utc_now_iso(),
+    # Determine generatedAt: carry forward from previous artifact in offline mode
+    # to avoid making stale data look freshly-generated.
+    if carry_forward_generated_at:
+        prev_generated_at = _load_previous_generated_at(previous_path)
+        generated_at = prev_generated_at if prev_generated_at else utc_now_iso()
+        if prev_generated_at:
+            print(
+                f"[build] carrying forward generatedAt={prev_generated_at} from previous artifact.",
+                flush=True,
+            )
+        else:
+            print(
+                "[build] no previous generatedAt found; using current time.",
+                flush=True,
+            )
+    else:
+        generated_at = utc_now_iso()
+
+    compiled: dict[str, Any] = {
+        "generatedAt": generated_at,
         "schemaVersion": 1,
         "categories": categories,
         "components": compiled_components,
+        "pipelineMode": pipeline_mode,
     }
+    if pipeline_mode == "offline":
+        compiled["enrichmentSkipped"] = True
     return compiled, errors
 
 
@@ -396,6 +433,24 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Skip invalid component JSON files instead of failing the build.",
     )
+    parser.add_argument(
+        "--pipeline-mode",
+        choices=["full", "offline"],
+        default="full",
+        help=(
+            "Pipeline mode recorded in the compiled artifact. "
+            "'offline' marks the artifact as built without enrichment and preserves "
+            "the previous generatedAt timestamp. Default: full."
+        ),
+    )
+    parser.add_argument(
+        "--carry-forward-generated-at",
+        action="store_true",
+        help=(
+            "Preserve the previous artifact's generatedAt instead of updating it to now. "
+            "Useful in offline mode to avoid making carried-forward metrics look freshly generated."
+        ),
+    )
     args = parser.parse_args(argv)
 
     script_path = Path(__file__).resolve()
@@ -420,6 +475,8 @@ def main(argv: list[str]) -> int:
         components_dir=components_dir,
         previous_path=previous_path,
         skip_invalid=args.skip_invalid,
+        pipeline_mode=args.pipeline_mode,
+        carry_forward_generated_at=args.carry_forward_generated_at,
     )
 
     if errors and not args.skip_invalid:
@@ -433,8 +490,15 @@ def main(argv: list[str]) -> int:
     dump_json_atomic(out_path, compiled)
 
     # Print a compact summary for CI logs
-    ts = utc_now_iso()
-    print(f"Wrote {len(compiled.get('components', []))} component(s) to {out_path} at {ts}.")
+    mode_label = f" (mode: {args.pipeline_mode})" if args.pipeline_mode != "full" else ""
+    print(
+        f"Wrote {len(compiled.get('components', []))} component(s) to {out_path}{mode_label}.",
+    )
+    if args.pipeline_mode == "offline":
+        print(
+            f"[build] pipelineMode=offline; generatedAt={compiled['generatedAt']}",
+            flush=True,
+        )
     if errors and args.skip_invalid:
         print(f"NOTE: Skipped {len(errors)} validation error(s).", file=sys.stderr)
         for e in errors:

@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pre-commit", "ruff"]
+dev = ["pre-commit", "pytest>=8.0", "ruff"]
 
 [tool.ruff]
 target-version = "py312"
@@ -24,3 +24,7 @@ ignore = ["E501"]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["components/registry/scripts/tests"]
+pythonpath = ["components/registry/scripts"]

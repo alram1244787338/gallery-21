@@ -13,6 +13,14 @@ The final score is:
 
 If recency data is missing, the score falls back to the stars-only term.
 
+Freshness handling (offline / --no-enrich safe):
+- When metrics are stale (fetchedAt older than --stale-threshold-hours or isStale=true),
+  the ranking is computed normally but tagged with `isStale: true` and `staleBuckets`.
+- When metrics are stale, `computedAt` is set to the oldest metric fetchedAt rather
+  than the current wall-clock time, so downstream consumers can tell the ranking is
+  based on old data.
+- Use --force-stale to override and compute as if data were fresh (computedAt = now).
+
 Run from the repo root (recommended):
 
     python components/registry/scripts/compute_ranking.py
@@ -28,6 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from _utils.freshness import detect_stale_metrics, oldest_metric_fetched_at
 from _utils.io import dump_json_atomic, load_json
 from _utils.time import parse_iso8601, utc_now_iso
 
@@ -135,7 +144,22 @@ def _recency_days(
     return days_since_update, gh_days, pypi_days
 
 
-def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime) -> dict[str, Any]:
+def _compute_ranking(
+    comp: dict[str, Any],
+    *,
+    cfg: RankingConfig,
+    now: datetime,
+    stale_threshold_hours: float,
+    force_stale: bool,
+) -> dict[str, Any]:
+    """Compute a ranking block for one component.
+
+    When stale metrics are detected:
+    - `isStale` is set to True in the ranking output.
+    - `staleBuckets` lists which buckets contributed to staleness.
+    - `computedAt` uses the oldest metric fetchedAt (not wall-clock now),
+      unless `force_stale` is True.
+    """
     stars = _stars_for_component(comp)
     stars_score = math.log10(stars + 1)
 
@@ -162,6 +186,18 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
     if downloads_score is not None:
         score += cfg.w_downloads * downloads_score
 
+    # --- Freshness assessment ---
+    stale_flags = detect_stale_metrics(comp, stale_threshold_hours=stale_threshold_hours)
+    is_stale = any(stale_flags.values())
+    stale_buckets = [b for b, s in stale_flags.items() if s]
+
+    # Determine computedAt: reflect actual data age when stale (unless forced).
+    if is_stale and not force_stale:
+        oldest_ts = oldest_metric_fetched_at(comp)
+        computed_at = oldest_ts if oldest_ts else utc_now_iso()
+    else:
+        computed_at = utc_now_iso()
+
     # Keep ranking explainable and stable.
     return {
         "score": score,
@@ -174,7 +210,9 @@ def _compute_ranking(comp: dict[str, Any], *, cfg: RankingConfig, now: datetime)
             "daysSincePypiRelease": pypi_days,
             "downloadsScore": downloads_score,
         },
-        "computedAt": utc_now_iso(),
+        "computedAt": computed_at,
+        "isStale": is_stale,
+        "staleBuckets": stale_buckets,
     }
 
 
@@ -184,6 +222,8 @@ def compute_rankings(
     compiled_out: Path,
     config_path: Path,
     limit: int | None,
+    stale_threshold_hours: float = 48.0,
+    force_stale: bool = False,
 ) -> int:
     obj = load_json(compiled_in)
     if not isinstance(obj, dict):
@@ -205,13 +245,74 @@ def compute_rankings(
     now = datetime.now(UTC)
 
     processed = 0
+    stale_count = 0
+    fresh_count = 0
+    no_metrics_count = 0
+    stale_examples: list[str] = []
+
     for comp in comps:
         if not isinstance(comp, dict):
             continue
         if limit is not None and processed >= limit:
             break
         processed += 1
-        comp["ranking"] = _compute_ranking(comp, cfg=cfg, now=now)
+
+        ranking = _compute_ranking(
+            comp,
+            cfg=cfg,
+            now=now,
+            stale_threshold_hours=stale_threshold_hours,
+            force_stale=force_stale,
+        )
+        comp["ranking"] = ranking
+
+        if ranking.get("isStale"):
+            stale_count += 1
+            title = comp.get("title", "?")
+            buckets = ranking.get("staleBuckets", [])
+            if len(stale_examples) < 3:
+                stale_examples.append(f"{title} ({', '.join(buckets)})")
+        else:
+            # Check if the component has any metrics at all.
+            metrics = comp.get("metrics")
+            has_any = False
+            if isinstance(metrics, dict):
+                for b in ("github", "pypi", "pypistats"):
+                    if isinstance(metrics.get(b), dict):
+                        has_any = True
+                        break
+            if has_any:
+                fresh_count += 1
+            else:
+                no_metrics_count += 1
+
+    # --- Print summary ---
+    print(f"[ranking] processed {processed} component(s)", flush=True)
+    print(
+        f"[ranking] fresh={fresh_count}  stale={stale_count}  "
+        f"no_metrics={no_metrics_count}",
+        flush=True,
+    )
+    if stale_count > 0:
+        print(
+            f"NOTE: {stale_count} component(s) have stale metrics "
+            f"(threshold: {stale_threshold_hours:.1f}h). "
+            "Their ranking.computedAt reflects the oldest metric fetchedAt, "
+            "not the current time.",
+            flush=True,
+        )
+        for ex in stale_examples:
+            print(f"  e.g. {ex}", flush=True)
+        if not force_stale:
+            print(
+                "  Use --force-stale to override and set computedAt=now for all components.",
+                flush=True,
+            )
+    if force_stale:
+        print(
+            "NOTE: --force-stale was used; all computedAt values reflect current time.",
+            flush=True,
+        )
 
     dump_json_atomic(compiled_out, obj)
     print(f"Wrote rankings for {processed} component(s) to {compiled_out}.")
@@ -248,6 +349,25 @@ def main(argv: list[str]) -> int:
         default=None,
         help="Only process the first N components (debug).",
     )
+    parser.add_argument(
+        "--stale-threshold-hours",
+        type=float,
+        default=48.0,
+        help=(
+            "Mark a component's ranking as stale when any metric bucket's fetchedAt "
+            "is older than this many hours (default: 48). "
+            "Use 0 to disable age-based staleness (only isStale flags are checked)."
+        ),
+    )
+    parser.add_argument(
+        "--force-stale",
+        action="store_true",
+        help=(
+            "Compute rankings even on stale metrics and set computedAt to the current "
+            "time (instead of reflecting the oldest metric's age). Use this only when "
+            "you explicitly want to publish rankings based on known-old data."
+        ),
+    )
     args = parser.parse_args(argv)
 
     script_path = Path(__file__).resolve()
@@ -275,6 +395,8 @@ def main(argv: list[str]) -> int:
         compiled_out=compiled_out,
         config_path=config_path,
         limit=args.limit,
+        stale_threshold_hours=args.stale_threshold_hours,
+        force_stale=args.force_stale,
     )
 
 

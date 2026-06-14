@@ -19,6 +19,17 @@ Typical CI usage:
 
     # Build + validate only (no network)
     python components/registry/scripts/run_pipeline.py --no-enrich
+
+Offline mode behavior (--no-enrich):
+
+    - Skips all network-dependent steps (images, GitHub, PyPI, pypistats enrichment).
+    - build_catalog runs with --pipeline-mode offline:
+      * generatedAt is preserved from the previous artifact (not updated to now).
+      * The artifact is tagged with pipelineMode=offline, enrichmentSkipped=true.
+    - compute_ranking still runs but:
+      * Metrics older than --stale-threshold-hours trigger ranking.isStale=true.
+      * ranking.computedAt reflects the oldest metric's fetchedAt, not wall-clock time.
+    - A summary is printed at the end explaining what ran and what was skipped.
 """
 
 from __future__ import annotations
@@ -72,7 +83,9 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help=(
             "Skip all network-dependent steps "
-            "(equivalent to --no-github --no-pypi --no-pypistats --no-images)."
+            "(equivalent to --no-github --no-pypi --no-pypistats --no-images). "
+            "In this mode, build_catalog preserves the previous generatedAt and tags "
+            "the artifact as pipelineMode=offline."
         ),
     )
     parser.add_argument(
@@ -97,6 +110,16 @@ def main(argv: list[str]) -> int:
         help=(
             "Only refetch enrichment metrics if existing fetchedAt values are older "
             "than this many hours (default: 24). Use 0 to force refetching everything."
+        ),
+    )
+    parser.add_argument(
+        "--stale-threshold-hours",
+        type=float,
+        default=48.0,
+        help=(
+            "Forwarded to compute_ranking.py. A metric bucket is considered stale when "
+            "its fetchedAt is older than this many hours (default: 48). "
+            "Stale metrics cause ranking.isStale=true."
         ),
     )
     parser.add_argument(
@@ -152,7 +175,8 @@ def main(argv: list[str]) -> int:
     scripts_dir = registry_root / "scripts"
     py = sys.executable
 
-    if args.no_enrich:
+    is_offline = bool(args.no_enrich)
+    if is_offline:
         args.no_github = True
         args.no_pypi = True
         args.no_pypistats = True
@@ -175,11 +199,17 @@ def main(argv: list[str]) -> int:
         print(f"\n==> {name}\n$ {' '.join(cmd)}", flush=True)
         return _run(cmd)
 
+    steps_run: list[str] = []
+    steps_skipped: list[str] = []
+
     # 1) Validate submissions
     if not args.no_validate:
         rc = run_step("Validate submissions", [py, str(scripts_dir / "validate.py")])
         if rc != 0:
             return rc
+        steps_run.append("validate")
+    else:
+        steps_skipped.append("validate")
 
     # 1b) Check image URLs (network). Keep this separate from schema validation so
     # CI can enforce it while local/offline runs can skip it.
@@ -190,15 +220,25 @@ def main(argv: list[str]) -> int:
         )
         if rc != 0:
             return rc
+        steps_run.append("images")
+    else:
+        steps_skipped.append("images")
 
     # 2) Build compiled artifact
     if not args.no_build:
-        rc = run_step(
-            "Build compiled catalog",
-            [py, str(scripts_dir / "build_catalog.py")],
-        )
+        build_cmd = [py, str(scripts_dir / "build_catalog.py")]
+        if is_offline:
+            build_cmd += [
+                "--pipeline-mode",
+                "offline",
+                "--carry-forward-generated-at",
+            ]
+        rc = run_step("Build compiled catalog", build_cmd)
         if rc != 0:
             return rc
+        steps_run.append("build")
+    else:
+        steps_skipped.append("build")
 
     # 3) Validate compiled artifact
     if not args.no_validate:
@@ -208,6 +248,9 @@ def main(argv: list[str]) -> int:
         )
         if rc != 0:
             return rc
+        steps_run.append("validate-compiled")
+    else:
+        steps_skipped.append("validate-compiled")
 
     # 4) Enrich (GitHub/PyPI/pypistats)
     services: list[str] = []
@@ -244,15 +287,26 @@ def main(argv: list[str]) -> int:
         rc = run_step("Enrich catalog", cmd)
         if rc != 0:
             return rc
+        steps_run.append(f"enrich({','.join(services)})")
+    else:
+        steps_skipped.append("enrich")
 
     # 6) Compute ranking
     if not args.no_ranking:
-        cmd = [py, str(scripts_dir / "compute_ranking.py")]
+        ranking_cmd = [
+            py,
+            str(scripts_dir / "compute_ranking.py"),
+            "--stale-threshold-hours",
+            str(args.stale_threshold_hours),
+        ]
         if args.limit is not None:
-            cmd += ["--limit", str(args.limit)]
-        rc = run_step("Compute ranking", cmd)
+            ranking_cmd += ["--limit", str(args.limit)]
+        rc = run_step("Compute ranking", ranking_cmd)
         if rc != 0:
             return rc
+        steps_run.append("ranking")
+    else:
+        steps_skipped.append("ranking")
 
     # 7) Final validate compiled artifact
     if not args.no_validate:
@@ -262,8 +316,35 @@ def main(argv: list[str]) -> int:
         )
         if rc != 0:
             return rc
+        steps_run.append("final-validate")
+    else:
+        steps_skipped.append("final-validate")
 
-    print("\nOK: pipeline completed successfully.")
+    # --- Pipeline summary ---
+    mode = "OFFLINE" if is_offline else "FULL"
+    print(f"\n{'=' * 60}")
+    print(f"Pipeline completed ({mode} mode)")
+    print(f"{'=' * 60}")
+    print(f"  Steps run:     {', '.join(steps_run) if steps_run else '(none)'}")
+    print(f"  Steps skipped: {', '.join(steps_skipped) if steps_skipped else '(none)'}")
+    if is_offline:
+        print(
+            "\n  OFFLINE mode notes:"
+            "\n    - No network calls were made (enrichment and image checks skipped)."
+            "\n    - generatedAt was preserved from the previous artifact."
+            "\n    - Artifact tagged with pipelineMode=offline, enrichmentSkipped=true."
+            "\n    - Rankings computed on carried-forward metrics; stale metrics are flagged"
+            f"\n      (threshold: {args.stale_threshold_hours:.0f}h). Check ranking.isStale"
+            "\n      in the output to identify components with outdated scores."
+        )
+    if "ranking" in steps_run and not services:
+        print(
+            "\n  WARNING: ranking was computed without fresh enrichment data."
+            "\n  Scores reflect carried-forward metrics and may be outdated."
+        )
+    print()
+
+    print("OK: pipeline completed successfully.")
     return 0
 
 

@@ -8,6 +8,15 @@
   "properties": {
     "generatedAt": { "type": "string", "format": "date-time" },
     "schemaVersion": { "type": "integer", "const": 1 },
+    "pipelineMode": {
+      "type": "string",
+      "enum": ["full", "offline"],
+      "description": "Indicates whether the pipeline ran with full enrichment (full) or without network calls (offline). In offline mode, metrics are carried forward from a previous artifact."
+    },
+    "enrichmentSkipped": {
+      "type": "boolean",
+      "description": "True when the artifact was built without running any enrichment steps. Present and true only in offline mode."
+    },
     "categories": {
       "type": "array",
       "minItems": 1,
@@ -120,6 +129,18 @@
             "properties": {
               "score": { "type": "number" },
               "computedAt": { "type": "string", "format": "date-time" },
+              "isStale": {
+                "type": "boolean",
+                "description": "True when one or more metric buckets used for this ranking were stale at computation time. Check staleBuckets for which ones."
+              },
+              "staleBuckets": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": ["github", "pypi", "pypistats"]
+                },
+                "description": "List of metric bucket names that were stale when this ranking was computed."
+              },
               "signals": {
                 "type": "object",
                 "additionalProperties": false,
