@@ -19,211 +19,25 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
-from collections.abc import Iterable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from _utils.github import normalize_github_repo_url
 from _utils.image_url_policy import DISALLOWED_IMAGE_HOSTS, DISALLOWED_IMAGE_QUERY_KEYS
-from _utils.io import load_json
 from _utils.paths import source_components_dir
+from _utils.validation_common import (
+    _LAYER_ORDER,
+    Severity,
+    ValidationIssue,
+    ValidationLayer,
+    get_validator,
+    validate_schema,
+)
 
 
-@dataclass(frozen=True)
-class ValidationIssue:
-    """A single schema validation issue tied to a specific JSON file."""
-
-    file: Path
-    schema: Path
-    message: str
-    json_path: str | None = None
-
-
-def _format_json_path(parts: Iterable[Any]) -> str:
-    """Format a jsonschema error path into a compact JSONPath-ish string.
-
-    Parameters
-    ----------
-    parts
-        Iterable of path parts (strings for object keys, ints for array indices),
-        typically from `jsonschema.ValidationError.path`.
-
-    Returns
-    -------
-    str
-        A compact, human-readable path (e.g. ``$``, ``author.github``,
-        ``components[0].title``).
-    """
-    out: list[str] = []
-    for p in parts:
-        if isinstance(p, int):
-            out.append(f"[{p}]")
-        else:
-            if out:
-                out.append(".")
-            out.append(str(p))
-    return "".join(out) or "$"
-
-
-def _load_schema(path: Path) -> dict[str, Any]:
-    """Load and sanity-check a JSON Schema from disk.
-
-    Parameters
-    ----------
-    path
-        Path to a JSON Schema file.
-
-    Returns
-    -------
-    dict[str, Any]
-        Parsed schema object.
-
-    Raises
-    ------
-    TypeError
-        If the schema file does not contain a JSON object.
-    """
-    obj = load_json(path)
-    if not isinstance(obj, dict):
-        raise TypeError(f"Schema must be a JSON object: {path}")
-    return obj
-
-
-def _get_validator(schema_path: Path) -> Any:
-    """Create a Draft2020-12 validator for a schema path (load schema once)."""
-    try:
-        from jsonschema import Draft202012Validator  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Missing dependency `jsonschema`.\n\nInstall dependencies with:\n  uv sync --dev"
-        ) from e
-    schema = _load_schema(schema_path)
-    return Draft202012Validator(schema)
-
-
-def _missing_required_fields(err: Any) -> list[str] | None:
-    """Compute missing required field names for a jsonschema "required" error.
-
-    jsonschema "required" errors can be noisy; this extracts the specific fields
-    missing at the failing location so output stays readable.
-
-    Parameters
-    ----------
-    err
-        A `jsonschema.ValidationError` instance (typed as `Any` to keep this
-        script dependency-light).
-
-    Returns
-    -------
-    list[str] | None
-        List of missing field names if applicable; otherwise ``None``.
-    """
-    if err.validator != "required" or not isinstance(err.validator_value, list):
-        return None
-    if not isinstance(err.instance, dict):
-        return None
-    # validator_value is the list of required fields for the schema at this path.
-    required: list[str] = [str(x) for x in err.validator_value]
-    return [k for k in required if k not in err.instance]
-
-
-def _validate_one(instance_path: Path, schema_path: Path, validator: Any) -> list[ValidationIssue]:
-    """Validate one JSON instance file against a JSON Schema.
-
-    Parameters
-    ----------
-    instance_path
-        Path to the JSON file to validate.
-    schema_path
-        Path to the JSON Schema file to validate against.
-
-    Returns
-    -------
-    list[ValidationIssue]
-        A (de-duplicated) list of validation issues for this file. Empty means
-        the file is valid.
-
-    Raises
-    ------
-    RuntimeError
-        If the `jsonschema` dependency is not installed.
-    TypeError
-        If the schema file is not a JSON object.
-    json.JSONDecodeError
-        If either the schema or instance JSON cannot be parsed.
-    """
-    instance = load_json(instance_path)
-    issues: list[ValidationIssue] = []
-
-    for err in sorted(validator.iter_errors(instance), key=lambda x: list(x.path)):
-        # jsonschema gives a path deque; make it readable
-        json_path = _format_json_path(err.path)
-        message = err.message
-
-        missing = _missing_required_fields(err)
-        if missing:
-            message = f"Missing required field(s): {', '.join(missing)}"
-
-        issues.append(
-            ValidationIssue(
-                file=instance_path,
-                schema=schema_path,
-                message=message,
-                json_path=json_path,
-            )
-        )
-
-    # De-dupe identical messages (common when multiple schemas report the same root-level issue)
-    deduped: list[ValidationIssue] = []
-    seen: set[tuple[str, str]] = set()
-    for issue in issues:
-        key = (issue.json_path or "$", issue.message)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(issue)
-    return deduped
-
-
-def validate_components(repo_root: Path) -> list[ValidationIssue]:
-    """Validate all source component submissions under `components/registry/components/`.
-
-    Parameters
-    ----------
-    repo_root
-        Path to the component-gallery repo root.
-
-    Returns
-    -------
-    list[ValidationIssue]
-        Validation issues across all source submission `*.json` files.
-    """
-    registry_root = repo_root / "components" / "registry"
-    schema_path = registry_root / "schemas" / "component.schema.json"
-    components_dir = source_components_dir(repo_root)
-    validator = _get_validator(schema_path)
-
-    issues: list[ValidationIssue] = []
-    for file_path in sorted(components_dir.iterdir()):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix != ".json":
-            issues.append(
-                ValidationIssue(
-                    file=file_path,
-                    schema=schema_path,
-                    message=(
-                        "Invalid file extension in components directory. "
-                        "Source component files must end with `.json`."
-                    ),
-                    json_path=None,
-                )
-            )
-    for json_file in sorted(components_dir.glob("*.json")):
-        issues.extend(_validate_one(json_file, schema_path, validator))
-    return issues
+# ---------------------------------------------------------------------------
+# URL / image helpers (kept local — specific to policy checks)
+# ---------------------------------------------------------------------------
 
 
 def _is_https_url(url: str) -> bool:
@@ -235,17 +49,6 @@ def _is_disallowed_url(url: str) -> bool:
     """Reject obvious XSS / unsafe schemes even if schema is relaxed."""
     parsed = urlparse(url)
     return parsed.scheme in {"javascript", "data", "file"}
-
-
-# --- Image URL hardening -----------------------------------------------------
-#
-# We want preview images to remain stable over time. In practice, the most common
-# sources of broken images are:
-# - Signed / expiring URLs (S3/GCS/CloudFront style query params)
-# - Proxy URLs like `camo.githubusercontent.com` (can change/expire and is not the
-#   canonical image source)
-#
-# We enforce these constraints only for `media.image` (not general links).
 
 
 def _has_disallowed_image_query_params(url: str) -> bool:
@@ -262,16 +65,59 @@ def _is_disallowed_image_host(url: str) -> bool:
     return host in DISALLOWED_IMAGE_HOSTS
 
 
+# ---------------------------------------------------------------------------
+# Source schema validation
+# ---------------------------------------------------------------------------
+
+
+def validate_components(repo_root: Path) -> list[ValidationIssue]:
+    """Validate all source component submissions under `components/registry/components/`.
+
+    Returns issues tagged with ``layer=SCHEMA``.
+    """
+    registry_root = repo_root / "components" / "registry"
+    schema_path = registry_root / "schemas" / "component.schema.json"
+    components_dir = source_components_dir(repo_root)
+    validator = get_validator(schema_path)
+
+    issues: list[ValidationIssue] = []
+    for file_path in sorted(components_dir.iterdir()):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix != ".json":
+            issues.append(
+                ValidationIssue(
+                    file=file_path,
+                    schema=schema_path,
+                    message=(
+                        "Invalid file extension in components directory. "
+                        "Source component files must end with `.json`."
+                    ),
+                    json_path=None,
+                    layer=ValidationLayer.SCHEMA,
+                )
+            )
+    for json_file in sorted(components_dir.glob("*.json")):
+        issues.extend(validate_schema(json_file, schema_path, validator, layer=ValidationLayer.SCHEMA))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Policy / lint validation
+# ---------------------------------------------------------------------------
+
+
 def validate_policies(
     repo_root: Path, *, max_component_bytes: int = 50_000
 ) -> list[ValidationIssue]:
     """Policy/lint checks beyond JSON Schema for source submission `*.json` files.
 
-    This matches the tech spec's CI expectations:
-    - Unique component identity (unique GitHub owner/repo across submissions)
-    - HTTPS-only URLs
-    - Basic abuse guardrails (file size)
+    Returns issues tagged with ``layer=POLICY``.  File-size violations are
+    reported at ``WARNING`` severity (they indicate potential abuse but do not
+    block schema correctness).
     """
+    from _utils.io import load_json
+
     registry_root = repo_root / "components" / "registry"
     schema_path = registry_root / "schemas" / "component.schema.json"
     components_dir = source_components_dir(repo_root)
@@ -279,30 +125,32 @@ def validate_policies(
     issues: list[ValidationIssue] = []
     first_by_repo: dict[str, Path] = {}
 
+    def _issue(
+        json_file: Path, message: str, json_path: str | None, severity: Severity = Severity.ERROR
+    ) -> ValidationIssue:
+        return ValidationIssue(
+            file=json_file,
+            schema=schema_path,
+            message=message,
+            json_path=json_path,
+            layer=ValidationLayer.POLICY,
+            severity=severity,
+        )
+
     for json_file in sorted(components_dir.glob("*.json")):
         # File size abuse guardrail
         try:
             size = json_file.stat().st_size
         except OSError as e:  # pragma: no cover
-            issues.append(
-                ValidationIssue(
-                    file=json_file,
-                    schema=schema_path,
-                    message=f"Could not stat file: {e}",
-                    json_path=None,
-                )
-            )
+            issues.append(_issue(json_file, f"Could not stat file: {e}", None))
             continue
         if size > max_component_bytes:
             issues.append(
-                ValidationIssue(
-                    file=json_file,
-                    schema=schema_path,
-                    message=(
-                        f"File too large ({size} bytes). "
-                        f"Max allowed is {max_component_bytes} bytes."
-                    ),
-                    json_path=None,
+                _issue(
+                    json_file,
+                    f"File too large ({size} bytes). Max allowed is {max_component_bytes} bytes.",
+                    None,
+                    severity=Severity.WARNING,
                 )
             )
 
@@ -318,16 +166,15 @@ def validate_policies(
         if not isinstance(links, dict):
             continue
 
+        # --- GitHub URL checks ---
         gh = links.get("github")
         if isinstance(gh, str) and gh:
-            # Extra HTTPS enforcement (schema already restricts, but keep as policy)
             if _is_disallowed_url(gh) or not _is_https_url(gh):
                 issues.append(
-                    ValidationIssue(
-                        file=json_file,
-                        schema=schema_path,
-                        message="URL must be https:// and must not use a disallowed scheme.",
-                        json_path="links.github",
+                    _issue(
+                        json_file,
+                        "URL must be https:// and must not use a disallowed scheme.",
+                        "links.github",
                     )
                 )
             else:
@@ -336,29 +183,19 @@ def validate_policies(
                     key = urlparse(canonical).path.lower().strip("/")
                     if key in first_by_repo:
                         issues.append(
-                            ValidationIssue(
-                                file=json_file,
-                                schema=schema_path,
-                                message=(
-                                    f"Duplicate component identity: links.github repo `{key}` "
-                                    f"already submitted in `{first_by_repo[key].name}`."
-                                ),
-                                json_path="links.github",
+                            _issue(
+                                json_file,
+                                f"Duplicate component identity: links.github repo `{key}` "
+                                f"already submitted in `{first_by_repo[key].name}`.",
+                                "links.github",
                             )
                         )
                     else:
                         first_by_repo[key] = json_file
                 except Exception as e:
-                    issues.append(
-                        ValidationIssue(
-                            file=json_file,
-                            schema=schema_path,
-                            message=str(e),
-                            json_path="links.github",
-                        )
-                    )
+                    issues.append(_issue(json_file, str(e), "links.github"))
 
-        # Enforce HTTPS for other URL fields we accept
+        # --- Other URL fields ---
         for path, val in (
             ("links.demo", links.get("demo")),
             ("links.docs", links.get("docs")),
@@ -367,80 +204,67 @@ def validate_policies(
                 continue
             if isinstance(val, str) and (_is_disallowed_url(val) or not _is_https_url(val)):
                 issues.append(
-                    ValidationIssue(
-                        file=json_file,
-                        schema=schema_path,
-                        message="URL must be https:// and must not use a disallowed scheme.",
-                        json_path=path,
+                    _issue(
+                        json_file,
+                        "URL must be https:// and must not use a disallowed scheme.",
+                        path,
                     )
                 )
 
+        # --- Image URL checks ---
         media = obj.get("media")
         if isinstance(media, dict):
             img = media.get("image")
             if img is None:
-                # Image is optional; null is allowed.
-                pass
+                pass  # Optional; null is allowed.
             elif isinstance(img, str):
                 if _is_disallowed_url(img) or not _is_https_url(img):
                     issues.append(
-                        ValidationIssue(
-                            file=json_file,
-                            schema=schema_path,
-                            message="URL must be https:// and must not use a disallowed scheme.",
-                            json_path="media.image",
+                        _issue(
+                            json_file,
+                            "URL must be https:// and must not use a disallowed scheme.",
+                            "media.image",
                         )
                     )
                 elif _is_disallowed_image_host(img):
                     issues.append(
-                        ValidationIssue(
-                            file=json_file,
-                            schema=schema_path,
-                            message=(
-                                "Image host is not allowed for `media.image` "
-                                "(brittle proxy). Use a stable upstream URL instead."
-                            ),
-                            json_path="media.image",
+                        _issue(
+                            json_file,
+                            "Image host is not allowed for `media.image` "
+                            "(brittle proxy). Use a stable upstream URL instead.",
+                            "media.image",
                         )
                     )
                 elif _has_disallowed_image_query_params(img):
                     issues.append(
-                        ValidationIssue(
-                            file=json_file,
-                            schema=schema_path,
-                            message=(
-                                "Signed/expiring image URLs are not allowed for `media.image` "
-                                "(disallowed query parameters detected)."
-                            ),
-                            json_path="media.image",
+                        _issue(
+                            json_file,
+                            "Signed/expiring image URLs are not allowed for `media.image` "
+                            "(disallowed query parameters detected).",
+                            "media.image",
                         )
                     )
             else:
                 issues.append(
-                    ValidationIssue(
-                        file=json_file,
-                        schema=schema_path,
-                        message="`media.image` must be a string URL or null.",
-                        json_path="media.image",
+                    _issue(
+                        json_file,
+                        "`media.image` must be a string URL or null.",
+                        "media.image",
                     )
                 )
 
     return issues
 
 
+# ---------------------------------------------------------------------------
+# Compiled artifact validation
+# ---------------------------------------------------------------------------
+
+
 def validate_compiled(repo_root: Path) -> list[ValidationIssue]:
     """Validate the compiled catalog artifact `components/registry/compiled/components.json`.
 
-    Parameters
-    ----------
-    repo_root
-        Path to the component-gallery repo root.
-
-    Returns
-    -------
-    list[ValidationIssue]
-        Validation issues for the compiled artifact. If the artifact is missing,
-        returns a single issue indicating it was skipped.
+    Returns issues tagged with ``layer=COMPILED``.
     """
     registry_root = repo_root / "components" / "registry"
     schema_path = registry_root / "schemas" / "compiled.schema.json"
@@ -452,10 +276,101 @@ def validate_compiled(repo_root: Path) -> list[ValidationIssue]:
                 schema=schema_path,
                 message="Compiled artifact not found (skipping).",
                 json_path=None,
+                layer=ValidationLayer.COMPILED,
+                severity=Severity.WARNING,
             )
         ]
-    validator = _get_validator(schema_path)
-    return _validate_one(compiled_path, schema_path, validator)
+    validator = get_validator(schema_path)
+    return validate_schema(
+        compiled_path, schema_path, validator, layer=ValidationLayer.COMPILED
+    )
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+_LAYER_LABELS: dict[ValidationLayer, str] = {
+    ValidationLayer.SCHEMA: "schema",
+    ValidationLayer.POLICY: "policy",
+    ValidationLayer.COMPILED: "compiled",
+}
+
+_SEVERITY_LABELS: dict[Severity, str] = {
+    Severity.ERROR: "ERROR",
+    Severity.WARNING: "WARN",
+}
+
+
+def _print_report(all_issues: list[ValidationIssue], repo_root: Path) -> None:
+    """Print a grouped, sorted error report to stderr.
+
+    Output order:
+    1. Errors before warnings.
+    2. Schema issues before policy issues before compiled issues.
+    3. Within each group, sorted by file then by json_path.
+    """
+    hard_errors = [i for i in all_issues if i.severity == Severity.ERROR]
+    warnings = [i for i in all_issues if i.severity == Severity.WARNING]
+
+    if not hard_errors and not warnings:
+        return
+
+    def _group(
+        issues: list[ValidationIssue],
+    ) -> dict[Path, list[ValidationIssue]]:
+        by_file: dict[Path, list[ValidationIssue]] = defaultdict(list)
+        for issue in issues:
+            by_file[issue.file].append(issue)
+        return by_file
+
+    def _rel(path: Path) -> Path:
+        """Best-effort relative path; falls back to absolute if not under repo_root."""
+        if path.is_absolute():
+            try:
+                return path.relative_to(repo_root)
+            except ValueError:
+                return path
+        return path
+
+    total_errors = len(hard_errors)
+    total_warnings = len(warnings)
+    parts: list[str] = []
+    if total_errors:
+        parts.append(f"{total_errors} error(s)")
+    if total_warnings:
+        parts.append(f"{total_warnings} warning(s)")
+
+    all_affected = set(i.file for i in all_issues if i.severity == Severity.ERROR)
+    total_files = len(all_affected) if all_affected else len(set(i.file for i in all_issues))
+
+    header = f"Found {', '.join(parts)} across {total_files} file(s):"
+    print(header, file=sys.stderr)
+
+    # Print errors first, then warnings.
+    for label, issues_to_print in [("ERROR", hard_errors), ("WARN", warnings)]:
+        if not issues_to_print:
+            continue
+        by_file = _group(issues_to_print)
+        for file_path in sorted(by_file.keys()):
+            file_issues = by_file[file_path]
+            rel = _rel(file_path)
+            schema_rel = _rel(file_issues[0].schema)
+            print(f"\n- {rel} ({len(file_issues)} {label.lower()}(s))", file=sys.stderr)
+            print(f"  schema: {schema_rel}", file=sys.stderr)
+            # Sort within file: layer order (schema→policy→compiled), then path, then message.
+            for issue in sorted(
+                file_issues,
+                key=lambda i: (_LAYER_ORDER[i.layer], i.json_path or "$", i.message),
+            ):
+                layer_tag = _LAYER_LABELS.get(issue.layer, "?")
+                jp = issue.json_path or "$"
+                print(f"  - [{layer_tag}] {jp}: {issue.message}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str]) -> int:
@@ -526,37 +441,26 @@ def main(argv: list[str]) -> int:
     if args.compiled:
         all_issues.extend(validate_compiled(repo_root))
 
-    hard_errors = [i for i in all_issues if "skipping" not in i.message.lower()]
+    # Sort all issues for deterministic output.
+    all_issues.sort(key=lambda i: i.sort_key())
+
+    hard_errors = [i for i in all_issues if i.severity == Severity.ERROR]
 
     if hard_errors:
-        # Group and compress output by file for readability.
-        by_file: dict[Path, list[ValidationIssue]] = defaultdict(list)
-        for issue in hard_errors:
-            by_file[issue.file].append(issue)
-
-        total_files = len(by_file)
-        print(
-            f"Found {len(hard_errors)} validation error(s) across {total_files} file(s):",
-            file=sys.stderr,
-        )
-
-        for file_path in sorted(by_file.keys()):
-            issues = by_file[file_path]
-            # All issues for a given file share the same schema in our usage.
-            schema_path = issues[0].schema
-            rel = file_path.relative_to(repo_root) if file_path.is_absolute() else file_path
-            print(f"\n- {rel} ({len(issues)} error(s))", file=sys.stderr)
-            print(f"  schema: {schema_path.relative_to(repo_root)}", file=sys.stderr)
-            for issue in sorted(issues, key=lambda i: (i.json_path or "$", i.message)):
-                jp = issue.json_path or "$"
-                print(f"  - {jp}: {issue.message}", file=sys.stderr)
+        _print_report(all_issues, repo_root)
         return 1
 
+    # No hard errors — print OK, then show any warnings / skipped notes.
     print("OK: all validated files passed.")
-    # If the only issues are "compiled missing (skipping)", be explicit.
-    skipped = [i for i in all_issues if "skipping" in i.message.lower()]
-    for s in skipped:
-        print(f"NOTE: {s.file} - {s.message}")
+    warnings = [i for i in all_issues if i.severity == Severity.WARNING]
+    if warnings:
+        for w in warnings:
+            layer_tag = _LAYER_LABELS.get(w.layer, "?")
+            try:
+                rel = w.file.relative_to(repo_root) if w.file.is_absolute() else w.file
+            except ValueError:
+                rel = w.file
+            print(f"NOTE: [{layer_tag}] {rel}: {w.message}")
     return 0
 
 

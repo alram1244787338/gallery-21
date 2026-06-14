@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +37,11 @@ from typing import Any
 from _utils.github import normalize_github_repo_url, repo_key
 from _utils.io import dump_json_atomic, load_json
 from _utils.time import utc_now_iso
+from _utils.validation_common import (
+    ValidationLayer,
+    load_schema as _load_schema_shared,
+    validate_schema_in_memory,
+)
 
 
 @dataclass(frozen=True)
@@ -49,10 +53,7 @@ class ComponentBuildError:
 
 def _load_schema(registry_root: Path) -> dict[str, Any]:
     schema_path = registry_root / "schemas" / "component.schema.json"
-    obj = load_json(schema_path)
-    if not isinstance(obj, dict):
-        raise TypeError(f"Schema must be a JSON object: {schema_path}")
-    return obj
+    return _load_schema_shared(schema_path)
 
 
 def _taxonomy_categories(registry_root: Path) -> list[str]:
@@ -70,37 +71,23 @@ def _taxonomy_categories(registry_root: Path) -> list[str]:
     return ["All", *enum]
 
 
-def _format_json_path(parts: Iterable[Any]) -> str:
-    out: list[str] = []
-    for p in parts:
-        if isinstance(p, int):
-            out.append(f"[{p}]")
-        else:
-            if out:
-                out.append(".")
-            out.append(str(p))
-    return "".join(out) or "$"
-
-
 def _validate_instance(instance: Any, schema: dict[str, Any]) -> list[ComponentBuildError]:
-    try:
-        from jsonschema import Draft202012Validator  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Missing dependency `jsonschema`.\n\nInstall dependencies with:\n  uv sync --dev"
-        ) from e
+    """Validate an in-memory submission against the schema.
 
-    validator = Draft202012Validator(schema)
-    errors: list[ComponentBuildError] = []
-    for err in sorted(validator.iter_errors(instance), key=lambda x: list(x.path)):
-        errors.append(
-            ComponentBuildError(
-                file=Path("<in-memory>"),
-                message=err.message,
-                json_path=_format_json_path(err.path),
-            )
+    Uses the shared ``validate_schema_in_memory`` and converts the results to
+    ``ComponentBuildError`` for backwards compatibility with the build pipeline.
+    """
+    issues = validate_schema_in_memory(
+        instance, schema, source_label="<in-memory>", layer=ValidationLayer.SCHEMA
+    )
+    return [
+        ComponentBuildError(
+            file=issue.file,
+            message=issue.message,
+            json_path=issue.json_path,
         )
-    return errors
+        for issue in issues
+    ]
 
 
 def _normalize_github_repo_url(url: str) -> str:
